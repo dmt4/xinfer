@@ -2,9 +2,11 @@ use crate::models::layers::distributed::{
     shard, Comm, MergedParallelColumnLinear, ReplicatedLinear, TensorParallelColumnLinear,
     TensorParallelRowLinear,
 };
+use crate::models::layers::linear::{LinearX, LnFp8};
 use crate::models::layers::{collect_key_map, VarBuilderX};
 use crate::utils::config::QuantConfig;
-use candle_core::{DType, Result, Tensor};
+use crate::utils::tensor_index::{Dist, TensorIndex};
+use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::var_builder::Shard;
 use candle_nn::{Activation, Module};
 use std::rc::Rc;
@@ -440,6 +442,77 @@ impl MLP {
             quant,
             dtype,
         )?;
+
+        Ok(Self {
+            gate_up_proj,
+            down_proj,
+            activation: activation.clone(),
+        })
+    }
+
+    /// Allocate empty GPU buffers for an MLP (no data).
+    pub fn new_alloc(
+        ti: &mut TensorIndex,
+        hidden_size: usize,
+        intermediate_size: usize,
+        activation: &Activation,
+        dtype: DType,
+        prefix: &str, // e.g. "model.layers.0.mlp"
+        iproc: usize,
+        nproc: usize,
+        block_size: &[usize],
+        device: &Device,
+        comm: Rc<Comm>,
+    ) -> Result<Self> {
+        // Allocate gate_proj (col-shard dim 0)
+        let gate_prefix = format!("{}.gate_proj", prefix);
+        let (gw, gs) = ti.alloc_weight_scale(
+            &gate_prefix,
+            (intermediate_size / nproc, hidden_size),
+            block_size,
+            Dist::ColumnSharded,
+            device,
+        )?;
+        let gate_linear = if let Some(gs) = gs {
+            LinearX::LnFp8(LnFp8::from_prealloc(gw, gs, None, block_size.to_vec()))
+        } else {
+            LinearX::new(gw, None, &None)?
+        };
+        let gate_proj = TensorParallelColumnLinear::new(gate_linear);
+
+        // Allocate up_proj (col-shard dim 0)
+        let up_prefix = format!("{}.up_proj", prefix);
+        let (uw, us) = ti.alloc_weight_scale(
+            &up_prefix,
+            (intermediate_size / nproc, hidden_size),
+            block_size,
+            Dist::ColumnSharded,
+            device,
+        )?;
+        let up_linear = if let Some(us) = us {
+            LinearX::LnFp8(LnFp8::from_prealloc(uw, us, None, block_size.to_vec()))
+        } else {
+            LinearX::new(uw, None, &None)?
+        };
+        let up_proj = TensorParallelColumnLinear::new(up_linear);
+
+        let gate_up_proj = GateUpProjection::Separate { gate_proj, up_proj };
+
+        // Allocate down_proj (row-shard dim 1)
+        let down_prefix = format!("{}.down_proj", prefix);
+        let (dw, ds) = ti.alloc_weight_scale(
+            &down_prefix,
+            (hidden_size, intermediate_size / nproc),
+            block_size,
+            Dist::RowSharded,
+            device,
+        )?;
+        let down_linear = if let Some(ds) = ds {
+            LinearX::LnFp8(LnFp8::from_prealloc(dw, ds, None, block_size.to_vec()))
+        } else {
+            LinearX::new(dw, None, &None)?
+        };
+        let down_proj = TensorParallelRowLinear::new(down_linear, comm, dtype);
 
         Ok(Self {
             gate_up_proj,

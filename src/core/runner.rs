@@ -36,6 +36,8 @@ use crate::{
     models::qwen3_vl::Qwen3VLForConditionalGeneration,
     utils::config::{Config, EngineConfig, ModelType, SamplingParams},
     utils::kvcache_allocator::KVCacheAllocator,
+    utils::tensor_index::TensorIndex,
+    utils::weight_loader::load_weights,
 };
 use attention_rs::cache;
 #[cfg(feature = "flashinfer")]
@@ -231,10 +233,9 @@ impl ModelRunner {
         self.logit_processor.sample_with_strategy(logits, sampling)
     }
 
-    #[allow(unused)]
     pub fn new(
         model_type: ModelType,
-        vb: &VarBuilderX,
+        vb: Option<&VarBuilderX>,
         comm: Rc<Comm>,
         econfig: &mut EngineConfig,
         config: &Config,
@@ -247,35 +248,83 @@ impl ModelRunner {
         stream: Option<LocalStream>,
     ) -> Result<Self> {
         attention_rs::reset_paged_attention_layer_counter();
-        let model = crate::build_model!(
-            model_type,
-            vb,
-            comm,
-            config,
-            dtype,
-            is_rope_i,
-            &device,
-            reporter,
-            {
-                Qwen3 => Qwen3ForCausalLM,
-                Qwen3MoE => Qwen3MoEForCausalLM,
-                Qwen3_5 => Qwen3_5ForCausalLM,
-                Qwen3_5MoE => Qwen3_5MoEForCausalLM,
-                LLaMa => LLaMaForCausalLM,
-                LLaMa4 => LLama4ForConditionalGeneration,
-                Phi4 => Phi4ForCausalLM,
-                GLM4 => GLM4ForCausalLM,
-                GLM4MoE => GLM4MoEForCausalLM,
-                GLM4MoeLite => GLM4MoeLiteForCausalLM,
-                DeepSeek => DeepSeekForCausalLM,
-                GLM5 => DeepSeekForCausalLM,
-                Mistral3VL => Mistral3ForConditionalGeneration,
-                Gemma3 => Gemma3ForConditionalGeneration,
-                Gemma4 => Gemma4ForCausalLM,
-                Qwen3VL => Qwen3VLForConditionalGeneration,
-                MiniMax => MiniMaxForCausalLM,
-            }
-        )?;
+        let model = if matches!(model_type, ModelType::GLM5) {
+            // Use the tensor-index alloc path: pre-allocate GPU buffers, then fill
+            // from safetensor files in a single broadcast pass, no per-rank mmap I/O.
+            // Only root reads the safetensor headers; the index is broadcast via NCCL.
+
+            let weight_dir = std::path::PathBuf::from(econfig.weight_path.as_ref().unwrap());
+
+            #[cfg(feature = "nccl")]
+            let is_root = comm.rank() == 0;
+            #[cfg(not(feature = "nccl"))]
+            let is_root = true;
+
+            let mut ti = if is_root {
+                let ti = TensorIndex::new(&weight_dir)?;
+                #[cfg(feature = "nccl")]
+                ti.bcast_from_root(&*comm)?;
+                ti
+            } else {
+                #[cfg(feature = "nccl")]
+                {
+                    TensorIndex::bcast(&*comm, false)?
+                }
+                #[cfg(not(feature = "nccl"))]
+                {
+                    unreachable!()
+                }
+            };
+
+            let model = DeepSeekForCausalLM::new_alloc(
+                &mut ti,
+                comm.clone(),
+                config,
+                dtype,
+                is_rope_i,
+                &device,
+                reporter.clone(),
+            )?;
+            load_weights(&ti, comm.clone(), &device, comm.rank(), comm.world_size())?;
+
+            tracing::info!("[root] Post-processing weights (dequantize kv_b_proj → w_uk/w_uv_t)");
+            model.post_load()?;
+
+            Model::GLM5(Arc::new(model))
+        } else {
+            let vb = vb.ok_or_else(|| {
+                candle_core::Error::Msg("VarBuilder required for non-GLM5 models".to_string())
+            })?;
+            crate::build_model!(
+                model_type,
+                vb,
+                comm,
+                config,
+                dtype,
+                is_rope_i,
+                &device,
+                reporter,
+                {
+                    Qwen3 => Qwen3ForCausalLM,
+                    Qwen3MoE => Qwen3MoEForCausalLM,
+                    Qwen3_5 => Qwen3_5ForCausalLM,
+                    Qwen3_5MoE => Qwen3_5MoEForCausalLM,
+                    LLaMa => LLaMaForCausalLM,
+                    LLaMa4 => LLama4ForConditionalGeneration,
+                    Phi4 => Phi4ForCausalLM,
+                    GLM4 => GLM4ForCausalLM,
+                    GLM4MoE => GLM4MoEForCausalLM,
+                    GLM4MoeLite => GLM4MoeLiteForCausalLM,
+                    DeepSeek => DeepSeekForCausalLM,
+                    GLM5 => DeepSeekForCausalLM,
+                    Mistral3VL => Mistral3ForConditionalGeneration,
+                    Gemma3 => Gemma3ForConditionalGeneration,
+                    Gemma4 => Gemma4ForCausalLM,
+                    Qwen3VL => Qwen3VLForConditionalGeneration,
+                    MiniMax => MiniMaxForCausalLM,
+                }
+            )?
+        };
 
         #[cfg(all(feature = "cuda", feature = "graph"))]
         let wrapper = crate::graph_wrapper!(
@@ -623,13 +672,22 @@ impl ModelRunner {
                 ModelType::Qwen3_5 | ModelType::Qwen3_5MoE | ModelType::Qwen3VL
             );
             let has_mtp_config = config.mtp_num_hidden_layers.unwrap_or(0) > 0;
-            let has_mtp_weights = vb.pp("mtp").has_key("fc.weight")
-                || vb.pp("mtp").has_key("layers.0.mlp.gate_proj.weight")
-                || vb.pp("mtp").has_key("layers.0.mlp.gate.weight");
+            let has_mtp_weights = vb
+                .expect("MTP requires VarBuilder")
+                .pp("mtp")
+                .has_key("fc.weight")
+                || vb
+                    .expect("MTP requires VarBuilder")
+                    .pp("mtp")
+                    .has_key("layers.0.mlp.gate_proj.weight")
+                || vb
+                    .expect("MTP requires VarBuilder")
+                    .pp("mtp")
+                    .has_key("layers.0.mlp.gate.weight");
 
             if is_mtp_model_type && (has_mtp_config || has_mtp_weights) && has_mtp_weights {
                 match crate::models::qwen3_5_mtp::Qwen3_5MtpHead::new(
-                    vb,
+                    vb.expect("MTP requires VarBuilder"),
                     comm.clone(),
                     config,
                     dtype,

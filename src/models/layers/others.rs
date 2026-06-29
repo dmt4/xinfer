@@ -1,5 +1,6 @@
 use crate::models::layers::VarBuilderX;
-use candle_core::{DType, IndexOp, Result, Tensor, WithDType};
+use crate::utils::tensor_index::{Dist, TensorIndex};
+use candle_core::{DType, Device, IndexOp, Result, Tensor, WithDType};
 use candle_nn::{var_builder::Shard, Module};
 use candle_nn::{Embedding, LayerNorm, RmsNorm};
 use either::Either;
@@ -7,6 +8,7 @@ use either::Either;
 pub struct NormX {
     norm: Either<RmsNorm, LayerNorm>,
     dtype: DType,
+    weight: Tensor,
 }
 impl NormX {
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
@@ -25,6 +27,10 @@ impl NormX {
             };
             Ok(out)
         }
+    }
+
+    pub fn weight(&self) -> &Tensor {
+        &self.weight
     }
 }
 
@@ -60,8 +66,9 @@ pub fn rms_norm_sharded(
 
     let weight = if is_gemma { (weight + 1.0)? } else { weight };
     Ok(NormX {
-        norm: Either::Left(RmsNorm::new(weight, eps)),
+        norm: Either::Left(RmsNorm::new(weight.clone(), eps)),
         dtype,
+        weight,
     })
 }
 
@@ -86,13 +93,15 @@ pub fn layer_norm(
             Either::Right(vb) => vb.get(size, "bias")?.dequantize(vb.device())?,
         };
         Ok(NormX {
-            norm: Either::Right(LayerNorm::new(weight, bias, eps)),
+            norm: Either::Right(LayerNorm::new(weight.clone(), bias, eps)),
             dtype,
+            weight,
         })
     } else {
         Ok(NormX {
-            norm: Either::Right(LayerNorm::new_no_bias(weight, eps)),
+            norm: Either::Right(LayerNorm::new_no_bias(weight.clone(), eps)),
             dtype,
+            weight,
         })
     }
 }
@@ -323,6 +332,103 @@ impl Module for Conv3dNoBias {
 
         (self.conv2d_1.forward(&xs1)? + self.conv2d_2.forward(&xs2)?)?.unsqueeze(2)
     }
+}
+
+// ---------------------------------------------------------------------------
+//  Alloc constructors (no data, just empty GPU buffers)
+// ---------------------------------------------------------------------------
+
+/// Allocate an RMS norm from TensorIndex metadata.
+pub fn rms_norm_alloc(
+    size: usize,
+    eps: f64,
+    ti: &mut TensorIndex,
+    prefix: &str,
+    dtype: DType,
+    device: &Device,
+) -> Result<NormX> {
+    let w_name = format!("{}.weight", prefix);
+    // Record dst_dtype so alloc_zeros and load_weights see the override.
+    if let Some(meta) = ti.tensors.get_mut(&w_name) {
+        meta.dst_dtype = Some(TensorIndex::dtype_to_string(dtype).to_string());
+    } else {
+        return Err(candle_core::Error::Msg(format!(
+            "rms_norm_alloc: '{}' not found",
+            w_name
+        )));
+    }
+    let weight = Tensor::zeros(size, dtype, device)?;
+    ti.register(&w_name, weight.clone(), Dist::Replicated);
+    Ok(NormX {
+        norm: Either::Left(RmsNorm::new(weight.clone(), eps)),
+        dtype,
+        weight,
+    })
+}
+
+/// Allocate an embedding table from TensorIndex metadata.
+pub fn embedding_alloc(
+    vocab_size: Option<usize>,
+    hidden_size: usize,
+    ti: &mut TensorIndex,
+    name: &str, // e.g. "model.embed_tokens"
+    device: &Device,
+) -> Result<(Embedding, usize)> {
+    let vs = vocab_size.ok_or_else(|| {
+        candle_core::Error::Msg("embedding_alloc: vocab_size must be specified".to_string())
+    })?;
+    let w_name = format!("{}.weight", name);
+    let meta = ti.meta(&w_name).ok_or_else(|| {
+        candle_core::Error::Msg(format!("embedding_alloc: '{}' not found", w_name))
+    })?;
+    let dtype = TensorIndex::parse_dtype(&meta.src_dtype).ok_or_else(|| {
+        candle_core::Error::Msg(format!(
+            "unsupported dtype {} for embedding",
+            meta.src_dtype
+        ))
+    })?;
+
+    let weight = Tensor::zeros((vs, hidden_size), dtype, device)?;
+    ti.register(&w_name, weight.clone(), Dist::Replicated);
+    Ok((Embedding::new(weight, hidden_size), vs))
+}
+
+/// Allocate a LayerNorm from TensorIndex metadata (weight + bias).
+pub fn layer_norm_alloc(
+    size: usize,
+    eps: f64,
+    ti: &mut TensorIndex,
+    prefix: &str,
+    dtype: DType,
+    device: &Device,
+) -> Result<NormX> {
+    let w_name = format!("{}.weight", prefix);
+    let b_name = format!("{}.bias", prefix);
+
+    // Record dst_dtype so alloc_zeros and load_weights see the override.
+    if let Some(meta) = ti.tensors.get_mut(&w_name) {
+        meta.dst_dtype = Some(TensorIndex::dtype_to_string(dtype).to_string());
+    } else {
+        return Err(candle_core::Error::Msg(format!(
+            "layer_norm_alloc: '{}' not found",
+            w_name
+        )));
+    }
+
+    let weight = Tensor::zeros(size, dtype, device)?;
+    ti.register(&w_name, weight.clone(), Dist::Replicated);
+    let bias = if ti.meta(&b_name).is_some() {
+        let b = Tensor::zeros(size, dtype, device)?;
+        ti.register(&b_name, b.clone(), Dist::Replicated);
+        b
+    } else {
+        Tensor::zeros(size, dtype, device)?
+    };
+    Ok(NormX {
+        norm: Either::Right(LayerNorm::new(weight.clone(), bias, eps)),
+        dtype,
+        weight,
+    })
 }
 
 pub fn masked_fill<D: WithDType>(xs: &Tensor, mask: &Tensor, value: D) -> Result<Tensor> {

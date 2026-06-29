@@ -18,6 +18,8 @@ pub mod logits_processor;
 pub mod multi_node;
 pub mod progress;
 pub mod special_tokens;
+pub mod tensor_index;
+pub mod weight_loader;
 use crate::core::GenerationOutput;
 use crate::models::gemma3::config::Gemma3Config;
 use crate::models::qwen3_vl::config::{

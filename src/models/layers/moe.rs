@@ -1,9 +1,10 @@
 // src/models/layers/moe.rs
 use crate::models::layers::distributed::{shard, AllReduce, Comm};
-use crate::models::layers::linear::{linear_no_bias_x as linear_no_bias, LinearX as Linear};
+use crate::models::layers::linear::{linear_no_bias_x as linear_no_bias, LinearX as Linear, LnFp8};
 use crate::models::layers::{isq_high_precision_dtype, VarBuilderX};
 use crate::utils::config::Config;
 use crate::utils::config::QuantConfig;
+use crate::utils::tensor_index::{Dist, TensorIndex};
 use attention_rs::moe;
 use attention_rs::moe::moe_gemm_fp8;
 use attention_rs::silu_and_mul::silu_and_mul;
@@ -11,7 +12,7 @@ use attention_rs::sort::ArgSortOp;
 use candle_core::Module;
 use candle_core::{
     quantized::{GgmlDType, QTensor},
-    DType, Result, Tensor, D,
+    Device, DType, Result, Tensor, D,
 };
 use candle_nn::var_builder::Shard;
 use candle_nn::Activation;
@@ -1972,6 +1973,129 @@ impl FusedMoeFp8 {
             ),
             all_reduce: AllReduce::new(comm.clone()),
             world_size: comm.world_size(),
+            dtype,
+            block_size: vec![by, bx],
+            gate_dtype,
+        })
+    }
+
+    /// Allocate empty GPU buffers for the FP8 MoE (no data).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_alloc(
+        cfg: &Config,
+        ti: &mut TensorIndex,
+        comm: Rc<Comm>,
+        dtype: DType,
+        block_size: &[usize],
+        device: &Device,
+        exp_prefix: &str,   // e.g. "model.layers.3.mlp.experts"
+        gate_prefix: &str,  // e.g. "model.layers.3.mlp.gate"
+        iproc: usize,
+        nproc: usize,
+    ) -> Result<Self> {
+        let moe_cfg = cfg.moe_cfg.as_ref().expect("MoE config is not available!");
+        let num_experts = moe_cfg.num_experts.unwrap();
+        let hidden_size = cfg.hidden_size;
+        let inter_size = moe_cfg.moe_intermediate_size;
+        let by = block_size[0];
+        let bx = block_size[1];
+
+        // --- Gate/router ---
+        let gate_dtype = if cfg.higher_precision_required() { DType::F32 } else { dtype };
+        let gate_name = format!("{}.weight", gate_prefix);
+        let gate_weight = ti.alloc_zeros(&gate_name, (num_experts, hidden_size), device)?;
+        ti.register(&gate_name, gate_weight.clone(), Dist::Replicated);
+        let gate = crate::models::layers::linear::LinearX::new(gate_weight, None, &None)?;
+
+        // --- Fused expert allocation ---
+        let local_m = inter_size / nproc;                 // per-rank intermediate size
+        let sn = (local_m + by - 1) / by;                // scale rows (gate/up)
+        let sk = (hidden_size + bx - 1) / bx;            // scale cols
+
+        // gate_up_experts: [N_EXP, local_m*2, H] F8_E4M3
+        let gate_up_experts = Tensor::zeros(
+            (num_experts, local_m * 2, hidden_size),
+            DType::F8E4M3, device,
+        )?;
+        // gate_up_experts_scale: [N_EXP, sn*2, sk] F32
+        let gate_up_experts_scale = Tensor::zeros(
+            (num_experts, sn * 2, sk),
+            DType::F32, device,
+        )?;
+
+        // down_experts: [N_EXP, H, local_m] F8_E4M3
+        let down_experts = Tensor::zeros(
+            (num_experts, hidden_size, local_m),
+            DType::F8E4M3, device,
+        )?;
+        // down_experts_scale: [N_EXP, ceil(H/BY), ceil(local_m/BX)] F32
+        let dn = (hidden_size + by - 1) / by;
+        let dk = (local_m + bx - 1) / bx;
+        let down_experts_scale = Tensor::zeros(
+            (num_experts, dn, dk),
+            DType::F32, device,
+        )?;
+
+        let w_size_n = local_m;  // gate outputs half of gate_up_experts
+
+        // e_score_correction_bias
+        let bias_name = format!("{}.e_score_correction_bias", gate_prefix);
+        let e_score_bias = if ti.meta(&bias_name).is_some() {
+            let b = Tensor::zeros(num_experts, DType::F32, device)?;
+            ti.register(&bias_name, b.clone(), Dist::Replicated);
+            Some(b)
+        } else {
+            None
+        };
+
+        // --- Register narrow views so the weight loader fills the fused buffers ---
+        // IMPORTANT: Use `squeeze(0)` instead of `reshape()` to avoid making
+        // a copy.  After `narrow(0, e, 1)` the tensor is 3-D [1, …, …]; 
+        // `reshape` on a non-contiguous narrow creates a *separate allocation*,
+        // leaving the fused buffer all-zeros.  `squeeze(0)` preserves the
+        // view into the original storage.
+        for e in 0..num_experts {
+            // gate_up_experts: [N_EXP, local_m*2, H]
+            let gu_slice = gate_up_experts.narrow(0, e, 1)?;        // [1, M*2, H]
+            let gu_scale_slice = gate_up_experts_scale.narrow(0, e, 1)?; // [1, sn*2, sk]
+
+            // expert e gate_proj: narrow dim1 [0:local_m] → squeeze → [local_m, H]
+            let gate_w = gu_slice.narrow(1, 0, local_m)?.squeeze(0)?;
+            ti.register(&format!("{}.{}.gate_proj.weight", exp_prefix, e), gate_w, Dist::ColumnSharded);
+            // expert e up_proj: narrow dim1 [local_m:2*local_m] → squeeze → [local_m, H]
+            let up_w = gu_slice.narrow(1, local_m, local_m)?.squeeze(0)?;
+            ti.register(&format!("{}.{}.up_proj.weight", exp_prefix, e), up_w, Dist::ColumnSharded);
+
+            // expert e gate_proj scale
+            let gate_s = gu_scale_slice.narrow(1, 0, sn)?.squeeze(0)?;
+            ti.register(&format!("{}.{}.gate_proj.weight_scale_inv", exp_prefix, e), gate_s, Dist::ColumnSharded);
+            // expert e up_proj scale
+            let up_s = gu_scale_slice.narrow(1, sn, sn)?.squeeze(0)?;
+            ti.register(&format!("{}.{}.up_proj.weight_scale_inv", exp_prefix, e), up_s, Dist::ColumnSharded);
+
+            // down_experts: [N_EXP, H, local_m]
+            let d_slice = down_experts.narrow(0, e, 1)?;            // [1, H, local_m]
+            let d_scale_slice = down_experts_scale.narrow(0, e, 1)?; // [1, dn, dk]
+
+            // expert e down_proj: squeeze → [H, local_m]
+            let down_w = d_slice.squeeze(0)?;
+            ti.register(&format!("{}.{}.down_proj.weight", exp_prefix, e), down_w, Dist::RowSharded);
+            // expert e down_proj scale
+            let down_s = d_scale_slice.squeeze(0)?;
+            ti.register(&format!("{}.{}.down_proj.weight_scale_inv", exp_prefix, e), down_s, Dist::RowSharded);
+        }
+
+        Ok(Self {
+            gate,
+            gate_up_experts,
+            gate_up_experts_scale,
+            down_experts,
+            down_experts_scale,
+            w_size_n,
+            act: cfg.hidden_act,
+            routing: MoeRouting::from_moe_cfg(moe_cfg, e_score_bias),
+            all_reduce: AllReduce::new(comm),
+            world_size: nproc,
             dtype,
             block_size: vec![by, bx],
             gate_dtype,

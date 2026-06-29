@@ -1,11 +1,14 @@
-use crate::models::layers::distributed::{shard, Comm, ReplicatedLinear};
+use crate::models::layers::distributed::{
+    alloc_replicated_fp8_linear, shard, Comm, ReplicatedLinear,
+};
 use crate::models::layers::indexer::{DsaIndexer, IndexerConfig};
-use crate::models::layers::others::{rms_norm, NormX};
+use crate::models::layers::others::{rms_norm, rms_norm_alloc, NormX};
 use crate::models::layers::rotary_emb::ApplyRotaryEmbedding;
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
+use crate::utils::tensor_index::TensorIndex;
 use attention_rs::InputMetadata;
-use candle_core::{DType, Result, Tensor, D};
+use candle_core::{DType, Device, Result, Tensor, D};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -79,6 +82,39 @@ impl MlaConfig {
     }
 }
 
+/// Adjust `sm_scale` and `rope_scale` for YaRN rope scaling, if configured.
+fn adjust_yarn_scale(sm_scale: f32, rope_scale: f32, config: &Config) -> (f32, f32) {
+    let mut sm_scale = sm_scale;
+    let mut rope_scale = rope_scale;
+    let Some(ref rope_scaling) = config.rope_scaling else {
+        return (sm_scale, rope_scale);
+    };
+    use crate::utils::config::RopeScalingValue;
+    let is_yarn = rope_scaling.get("type").and_then(|v| {
+        if let RopeScalingValue::String(s) = v {
+            Some(s.as_str())
+        } else {
+            None
+        }
+    }) == Some("yarn");
+    if is_yarn {
+        let factor = rope_scaling
+            .get("factor")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0) as f32;
+        let mscale_all_dim = rope_scaling
+            .get("mscale_all_dim")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as f32;
+        if mscale_all_dim > 0.0 && factor > 1.0 {
+            let mscale = 0.1 * mscale_all_dim * factor.ln() + 1.0;
+            sm_scale *= mscale * mscale;
+        }
+        rope_scale = 1.0;
+    }
+    (sm_scale, rope_scale)
+}
+
 #[allow(unused)]
 pub struct MlaAttention {
     q_a_proj: Option<ReplicatedLinear>,
@@ -107,6 +143,10 @@ pub struct MlaAttention {
 }
 
 impl MlaAttention {
+    pub fn kv_b_proj_weight(&self) -> Option<&Tensor> {
+        self.kv_b_proj.as_ref().map(|kv| kv.weight())
+    }
+
     pub fn new(
         vb: VarBuilderX,
         _comm: Rc<Comm>,
@@ -354,34 +394,11 @@ impl MlaAttention {
             (w_uk, w_uv_t)
         };
 
-        let mut sm_scale = 1.0 / (q_head_dim as f32).sqrt();
-        let mut rope_scale = 1.0f32;
+        let sm_scale = 1.0 / (q_head_dim as f32).sqrt();
+        let rope_scale = 1.0f32;
 
-        if let Some(ref rope_scaling) = config.rope_scaling {
-            use crate::utils::config::RopeScalingValue;
-            let is_yarn = rope_scaling.get("type").and_then(|v| {
-                if let RopeScalingValue::String(s) = v {
-                    Some(s.as_str())
-                } else {
-                    None
-                }
-            }) == Some("yarn");
-            if is_yarn {
-                let factor = rope_scaling
-                    .get("factor")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(1.0) as f32;
-                let mscale_all_dim = rope_scaling
-                    .get("mscale_all_dim")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0) as f32;
-                if mscale_all_dim > 0.0 && factor > 1.0 {
-                    let mscale = 0.1 * mscale_all_dim * factor.ln() + 1.0;
-                    sm_scale *= mscale * mscale;
-                }
-                rope_scale = 1.0;
-            }
-        }
+        let (sm_scale, rope_scale) =
+            adjust_yarn_scale(sm_scale, rope_scale, config);
 
         let skip_offset = mla_cfg.index_skip_topk_offset.unwrap_or(1);
         let has_indexer = mla_cfg.index_head_dim.is_some()
@@ -427,6 +444,216 @@ impl MlaAttention {
             dtype,
             indexer,
         })
+    }
+}
+
+impl MlaAttention {
+    /// Allocate empty GPU buffers for all MLA weights (no data).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_alloc(
+        ti: &mut TensorIndex,
+        mla_cfg: &MlaConfig,
+        config: &Config,
+        dtype: DType,
+        device: &Device,
+        layer_idx: usize,
+        block_size: &[usize],
+    ) -> Result<Self> {
+        let hidden_size = mla_cfg.hidden_size;
+        let num_heads = mla_cfg.num_attention_heads;
+        let kv_lora_rank = mla_cfg.kv_lora_rank;
+        let qk_nope_head_dim = mla_cfg.qk_nope_head_dim;
+        let qk_rope_head_dim = mla_cfg.qk_rope_head_dim;
+        let v_head_dim = mla_cfg.v_head_dim;
+        let q_head_dim = qk_nope_head_dim + qk_rope_head_dim;
+        let attn_prefix = format!("model.layers.{}.self_attn", layer_idx);
+        let norm_dtype = dtype;
+
+        let (q_a_proj, q_a_layernorm, q_b_proj, q_proj) =
+            if let Some(q_lora_rank) = mla_cfg.q_lora_rank {
+                let q_a = alloc_replicated_fp8_linear(
+                    ti,
+                    &format!("{}.q_a_proj", attn_prefix),
+                    q_lora_rank,
+                    hidden_size,
+                    mla_cfg.attention_bias,
+                    block_size,
+                    device,
+                )?;
+                let q_a_ln = rms_norm_alloc(
+                    q_lora_rank,
+                    mla_cfg.rms_norm_eps,
+                    ti,
+                    &format!("{}.q_a_layernorm", attn_prefix),
+                    norm_dtype,
+                    device,
+                )?;
+                let q_b = alloc_replicated_fp8_linear(
+                    ti,
+                    &format!("{}.q_b_proj", attn_prefix),
+                    num_heads * q_head_dim,
+                    q_lora_rank,
+                    false,
+                    block_size,
+                    device,
+                )?;
+                (Some(q_a), Some(q_a_ln), Some(q_b), None)
+            } else {
+                let q = alloc_replicated_fp8_linear(
+                    ti,
+                    &format!("{}.q_proj", attn_prefix),
+                    num_heads * q_head_dim,
+                    hidden_size,
+                    mla_cfg.attention_bias,
+                    block_size,
+                    device,
+                )?;
+                (None, None, None, Some(q))
+            };
+
+        let kv_a_proj_with_mqa = alloc_replicated_fp8_linear(
+            ti,
+            &format!("{}.kv_a_proj_with_mqa", attn_prefix),
+            kv_lora_rank + qk_rope_head_dim,
+            hidden_size,
+            mla_cfg.attention_bias,
+            block_size,
+            device,
+        )?;
+
+        let kv_a_layernorm = rms_norm_alloc(
+            kv_lora_rank,
+            mla_cfg.rms_norm_eps,
+            ti,
+            &format!("{}.kv_a_layernorm", attn_prefix),
+            norm_dtype,
+            device,
+        )?;
+
+        let kv_b_proj = {
+            let w = alloc_replicated_fp8_linear(
+                ti,
+                &format!("{}.kv_b_proj", attn_prefix),
+                num_heads * (qk_nope_head_dim + v_head_dim),
+                kv_lora_rank,
+                false,
+                block_size,
+                device,
+            )?;
+            Some(w)
+        };
+
+        let o_proj = alloc_replicated_fp8_linear(
+            ti,
+            &format!("{}.o_proj", attn_prefix),
+            hidden_size,
+            num_heads * v_head_dim,
+            false,
+            block_size,
+            device,
+        )?;
+
+        // Placeholders for w_uk / w_uv_t — filled from kv_b_proj during data loading.
+        // Allocate zero tensors of the target shape / dtype (BF16 after dequant).
+        let w_uk = Tensor::zeros((num_heads, qk_nope_head_dim, kv_lora_rank), dtype, device)?;
+        let w_uv_t = Tensor::zeros((num_heads, kv_lora_rank, v_head_dim), dtype, device)?;
+
+        let sm_scale = 1.0 / (q_head_dim as f32).sqrt();
+        let rope_scale = 1.0f32;
+
+        let (sm_scale, rope_scale) =
+            adjust_yarn_scale(sm_scale, rope_scale, config);
+
+        let skip_offset = mla_cfg.index_skip_topk_offset.unwrap_or(1);
+        let idx_prefix = format!("{}.indexer", attn_prefix);
+        let has_indexer = mla_cfg.index_head_dim.is_some()
+            && layer_idx >= skip_offset
+            && ti.meta(&format!("{}.wq_b.weight", idx_prefix)).is_some();
+        let indexer = if has_indexer {
+            let idx_cfg = IndexerConfig {
+                index_head_dim: mla_cfg.index_head_dim.unwrap(),
+                index_n_heads: mla_cfg.index_n_heads.unwrap_or(4),
+                index_topk: mla_cfg.index_topk.unwrap_or(2048),
+                index_skip_topk_offset: mla_cfg.index_skip_topk_offset.unwrap_or(1),
+                qk_rope_head_dim,
+                q_lora_rank: mla_cfg.q_lora_rank.unwrap_or(256),
+                hidden_size,
+            };
+            Some(DsaIndexer::new_alloc(
+                ti,
+                idx_cfg,
+                &idx_prefix,
+                block_size,
+                device,
+            )?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            q_a_proj,
+            q_a_layernorm,
+            q_b_proj,
+            q_proj,
+            kv_a_proj_with_mqa,
+            kv_a_layernorm,
+            kv_b_proj,
+            o_proj,
+            w_uk,
+            w_uv_t,
+            num_heads,
+            q_head_dim,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            kv_lora_rank,
+            v_head_dim,
+            sm_scale,
+            rope_scale,
+            rope_theta: config.rope_theta.unwrap_or(10000.0) as f32,
+            promote_qk_to_f32: config.higher_precision_required(),
+            dtype,
+            indexer,
+        })
+    }
+
+    /// Post-load processing: dequantize `kv_b_proj` and fill `w_uk` / `w_uv_t`.
+    ///
+    /// GLM-5.2 stores `kv_b_proj` as FP8 weights, from which `w_uk` and `w_uv_t`
+    /// are derived (dequantize → reshape → split).  This is the same computation
+    /// that `new()` does inline during VarBuilderX construction; we run it after
+    /// `load_weights` fills the FP8 buffers.
+    pub fn post_load(&self) -> Result<()> {
+        let Some(ref kv_b) = self.kv_b_proj else {
+            return Ok(());
+        };
+        let kv_b_out_dim = self.num_heads * (self.qk_nope_head_dim + self.v_head_dim);
+        let device = self.w_uk.device();
+        let w_dtype = self.w_uk.dtype();
+
+        // Dequantize: identity × W^T = W^T  →  transpose → W
+        let identity = Tensor::eye(self.kv_lora_rank, w_dtype, device)?;
+        let dequantized = kv_b.forward(&identity)?; // [kv_lora_rank, kv_b_out_dim]
+        let w = dequantized.t()?.contiguous()?; // [kv_b_out_dim, kv_lora_rank]
+
+        // Reshape to per-head layout
+        let w = w.reshape((
+            self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+            self.kv_lora_rank,
+        ))?;
+
+        // w_uk  = [:, 0:qk_nope_head_dim, :]
+        let w_uk_src = w.narrow(1, 0, self.qk_nope_head_dim)?.contiguous()?;
+        self.w_uk.copy_(&w_uk_src, 0)?;
+
+        // w_uv_t = transpose of [:, qk_nope_head_dim:, :]
+        let w_uv = w
+            .narrow(1, self.qk_nope_head_dim, self.v_head_dim)?
+            .contiguous()?;
+        let w_uv_t_src = w_uv.transpose(1, 2)?.contiguous()?;
+        self.w_uv_t.copy_(&w_uv_t_src, 0)?;
+
+        Ok(())
     }
 
     /// Project the fused kernel output through w_uv_t and reshape for o_proj.

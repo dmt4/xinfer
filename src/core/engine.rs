@@ -221,7 +221,14 @@ impl LLMEngine {
             let handle = progress_worker(1, config.num_hidden_layers, &reporter);
             let mut model_runner = {
                 let _guard = candle_core::InferenceMode::enter();
-                let vb = VarBuilderX::new(&model_pathes, is_gguf, dtype, &device)?;
+
+                // GLM5 uses the tensor-index alloc path which does not need
+                // VarBuilderX (saves ~40 min of mmap I/O on multi-rank nodes).
+                let vb = if matches!(model_type, ModelType::GLM5) {
+                    None
+                } else {
+                    Some(VarBuilderX::new(&model_pathes, is_gguf, dtype, &device)?)
+                };
                 let transfer = if let Some(p_cfg) = &econfig.pd_config {
                     Some(Arc::new(Transfer::new(
                         p_cfg.clone(),
@@ -235,7 +242,7 @@ impl LLMEngine {
 
                 let runner = ModelRunner::new(
                     model_type.clone(),
-                    &vb,
+                    vb.as_ref(),
                     #[cfg(not(feature = "nccl"))]
                     Rc::new(Comm::default()),
                     #[cfg(feature = "nccl")]
@@ -1828,7 +1835,6 @@ impl LLMEngine {
                                 let decode_output = tokenizer
                                     .decode(&decoded_ids, true)
                                     .expect("unable to decode!");
-
                                 output = Some(GenerationOutput {
                                     seq_id,
                                     prompt_length,

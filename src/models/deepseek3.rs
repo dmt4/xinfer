@@ -3,11 +3,13 @@ use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mla_attention::{MlaAttention, MlaConfig};
 use crate::models::layers::mlp::MLP;
 use crate::models::layers::moe::{FusedMoe, FusedMoeFp8, FusedMoeGGUF, FusedMoeISQ};
-use crate::models::layers::others::{embedding, rms_norm, NormX};
+use crate::models::layers::others::{embedding, embedding_alloc, rms_norm, rms_norm_alloc, NormX};
 use crate::models::layers::rotary_emb::{ApplyRotaryEmbedding, ScalingRotaryEmbedding};
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
 use crate::utils::progress::ProgressLike;
+use crate::utils::tensor_index::Dist;
+use crate::utils::tensor_index::TensorIndex;
 use attention_rs::InputMetadata;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::Module;
@@ -203,6 +205,138 @@ impl DeepSeekDecoderLayer {
         })
     }
 
+    /// Allocate empty GPU buffers for a decoder layer (no data).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_alloc(
+        config: &Config,
+        ti: &mut TensorIndex,
+        comm: Rc<Comm>,
+        dtype: DType,
+        device: &Device,
+        layer_idx: usize,
+        nproc: usize,
+        iproc: usize,
+        rotary_emb: Arc<ScalingRotaryEmbedding>,
+    ) -> Result<Self> {
+        let mla_cfg = MlaConfig::from_config(config);
+
+        let block_size = config
+            .quantization_config
+            .as_ref()
+            .and_then(|q| q.weight_block_size.clone())
+            .unwrap_or(vec![128, 128]);
+
+        let self_attn =
+            MlaAttention::new_alloc(ti, &mla_cfg, config, dtype, device, layer_idx, &block_size)?;
+
+        let moe_cfg = config
+            .moe_cfg
+            .as_ref()
+            .expect("MoE config is not available!");
+        let is_moe_layer = layer_idx >= moe_cfg.first_k_dense_replace.unwrap_or(0)
+            && moe_cfg.num_experts.is_some();
+
+        let mlp = if is_moe_layer {
+            if let Some(quant_config) = &config.quantization_config {
+                if quant_config.quant_method == "fp8" {
+                    let exp_prefix = format!("model.layers.{}.mlp.experts", layer_idx);
+                    let gate_prefix = format!("model.layers.{}.mlp.gate", layer_idx);
+                    MoeOrMlp::FusedMoeFp8(FusedMoeFp8::new_alloc(
+                        config,
+                        ti,
+                        comm.clone(),
+                        dtype,
+                        &block_size,
+                        device,
+                        &exp_prefix,
+                        &gate_prefix,
+                        iproc,
+                        nproc,
+                    )?)
+                } else {
+                    candle_core::bail!("MoE non-FP8 quant not supported in alloc path yet")
+                }
+            } else {
+                candle_core::bail!("MoE without quant config not supported in alloc path")
+            }
+        } else {
+            let mlp_prefix = format!("model.layers.{}.mlp", layer_idx);
+            MoeOrMlp::Mlp(MLP::new_alloc(
+                ti,
+                config.hidden_size,
+                config.intermediate_size,
+                &config.hidden_act,
+                dtype,
+                &mlp_prefix,
+                iproc,
+                nproc,
+                &block_size,
+                device,
+                comm.clone(),
+            )?)
+        };
+
+        let shared_expert = if is_moe_layer {
+            if let Some(inter_size) = moe_cfg.shared_expert_intermediate_size {
+                if inter_size > 0 {
+                    let shr_prefix = format!("model.layers.{}.mlp.shared_experts", layer_idx);
+                    let mlp = MLP::new_alloc(
+                        ti,
+                        config.hidden_size,
+                        inter_size * moe_cfg.n_shared_experts.unwrap_or(1),
+                        &config.hidden_act,
+                        dtype,
+                        &shr_prefix,
+                        iproc,
+                        nproc,
+                        &block_size,
+                        device,
+                        comm.clone(),
+                    )?;
+                    Some(mlp)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let input_layernorm = rms_norm_alloc(
+            config.hidden_size,
+            config.rms_norm_eps,
+            ti,
+            &format!("model.layers.{}.input_layernorm", layer_idx),
+            DType::F32,
+            device,
+        )?;
+        let post_attention_layernorm = rms_norm_alloc(
+            config.hidden_size,
+            config.rms_norm_eps,
+            ti,
+            &format!("model.layers.{}.post_attention_layernorm", layer_idx),
+            DType::F32,
+            device,
+        )?;
+
+        Ok(Self {
+            self_attn,
+            mlp,
+            shared_expert,
+            input_layernorm,
+            post_attention_layernorm,
+            rotary_emb,
+        })
+    }
+
+    /// Post-load processing for each layer: fill `w_uk` / `w_uv_t` from kv_b_proj.
+    pub fn post_load(&self) -> Result<()> {
+        self.self_attn.post_load()?;
+        Ok(())
+    }
+
     pub fn forward(
         &self,
         xs: &Tensor,
@@ -277,22 +411,13 @@ impl DeepSeekForCausalLM {
             dtype,
         )?;
 
-        let rotary_emb = {
-            let mut mla_config = config.clone();
-            mla_config.head_dim = Some(mla_cfg.qk_rope_head_dim);
-            mla_config.partial_rotary_factor = None;
-            Arc::new(ScalingRotaryEmbedding::new(
-                if is_qvar_builder || config.higher_precision_required() {
-                    DType::F32
-                } else {
-                    dtype
-                },
-                &mla_config,
-                &vb.device(),
-                is_rope_i,
-                config.rope_theta,
-            )?)
+        let emb_dtype = if is_qvar_builder || config.higher_precision_required() {
+            DType::F32
+        } else {
+            dtype
         };
+        let rotary_emb =
+            build_rotary_emb(config, &mla_cfg, emb_dtype, is_rope_i, &vb.device())?;
 
         let reporter = progress_reporter.clone();
         let mut layers = Vec::new();
@@ -363,6 +488,108 @@ impl DeepSeekForCausalLM {
             vocab_size,
             is_qvar_builder,
         })
+    }
+
+    /// Allocate empty GPU buffers for the entire model (no data).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_alloc(
+        ti: &mut TensorIndex,
+        comm: Rc<Comm>,
+        config: &Config,
+        dtype: DType,
+        is_rope_i: bool,
+        device: &Device,
+        progress_reporter: Arc<RwLock<Box<dyn ProgressLike>>>,
+    ) -> Result<Self> {
+        let nproc = comm.world_size();
+        let iproc = comm.rank();
+
+        // embed_tokens
+        let (embed_tokens, vocab_size) = embedding_alloc(
+            config.vocab_size,
+            config.hidden_size,
+            ti,
+            "model.embed_tokens",
+            device,
+        )?;
+
+        // Rotary embeddings
+        let mla_cfg = MlaConfig::from_config(config);
+        let emb_dtype = if config.higher_precision_required() {
+            DType::F32
+        } else {
+            dtype
+        };
+        let rotary_emb =
+            build_rotary_emb(config, &mla_cfg, emb_dtype, is_rope_i, device)?;
+
+        // Layers
+        let reporter = progress_reporter.clone();
+        let mut layers = Vec::new();
+        for i in 0..config.num_hidden_layers {
+            let layer = DeepSeekDecoderLayer::new_alloc(
+                config,
+                ti,
+                comm.clone(),
+                dtype,
+                device,
+                i,
+                nproc,
+                iproc,
+                rotary_emb.clone(),
+            )?;
+            layers.push(layer);
+            reporter.write().set_progress(i + 1);
+        }
+
+        // Final norm
+        let norm = rms_norm_alloc(
+            config.hidden_size,
+            config.rms_norm_eps,
+            ti,
+            "model.norm",
+            DType::F32,
+            device,
+        )?;
+
+        // lm_head (vocab-parallel)
+        let v = vocab_size;
+        // pad_vocab_size logic from distributed.rs
+        let padding = 64; // VOCAB_PADDING_SIZE
+        let padded = ((v + padding - 1) / padding) * padding;
+        let per_rank = ((padded + nproc - 1) / nproc) * nproc;
+        let padded_vocab = ((per_rank + padding - 1) / padding) * padding;
+        let local_vocab = padded_vocab / nproc;
+
+        let lm_head_name = "lm_head.weight";
+        let meta = ti.meta(lm_head_name).ok_or_else(|| {
+            candle_core::Error::Msg("lm_head.weight not found in TensorIndex".to_string())
+        })?;
+        let lm_dtype = TensorIndex::parse_dtype(&meta.src_dtype).unwrap_or(dtype);
+        let lm_weight = Tensor::zeros((local_vocab, config.hidden_size), lm_dtype, device)?;
+        ti.register(lm_head_name, lm_weight.clone(), Dist::VocabParallel);
+        let lm_head = VocabParallelLinear::new_alloc(lm_weight, comm, vocab_size, dtype)?;
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            device: device.clone(),
+            config: config.clone(),
+            dtype,
+            vocab_size,
+            is_qvar_builder: false,
+        })
+    }
+
+    /// Post-load processing: fill per-layer derived tensors (w_uk / w_uv_t) now that
+    /// kv_b_proj weights have been loaded.
+    pub fn post_load(&self) -> Result<()> {
+        for layer in &self.layers {
+            layer.post_load()?;
+        }
+        Ok(())
     }
 
     pub fn embed_forward(&self, xs: &Tensor) -> Result<Tensor> {
@@ -468,4 +695,28 @@ impl DeepSeekForCausalLM {
     pub fn dtype(&self) -> DType {
         self.dtype
     }
+}
+
+fn build_rotary_emb(
+    config: &Config,
+    mla_cfg: &MlaConfig,
+    dtype: DType,
+    is_rope_i: bool,
+    device: &Device,
+) -> Result<Arc<ScalingRotaryEmbedding>> {
+    let mut mla_config = config.clone();
+    mla_config.head_dim = Some(mla_cfg.qk_rope_head_dim);
+    mla_config.partial_rotary_factor = None;
+    let emb_dtype = if config.higher_precision_required() {
+        DType::F32
+    } else {
+        dtype
+    };
+    Ok(Arc::new(ScalingRotaryEmbedding::new(
+        emb_dtype,
+        &mla_config,
+        device,
+        is_rope_i,
+        config.rope_theta,
+    )?))
 }

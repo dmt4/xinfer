@@ -5,11 +5,12 @@ use crate::models::layers::linear::{
 use crate::models::layers::{isq_high_precision_quant, VarBuilderX};
 use crate::utils::config::QuantConfig;
 use crate::utils::gguf_helper::restore_qwen35_qkv_weight;
+use crate::utils::tensor_index::{Dist, TensorIndex};
 #[cfg(feature = "nccl")]
 pub use candle_core::cuda_backend::cudarc::nccl::safe::{Comm, Id};
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::CustomOp1;
-use candle_core::{CpuStorage, DType, Layout, Module, Result, Shape, Tensor};
+use candle_core::{CpuStorage, DType, Device, Layout, Module, Result, Shape, Tensor};
 use candle_nn::var_builder::Shard;
 use either::Either;
 #[cfg(not(feature = "nccl"))]
@@ -459,6 +460,19 @@ impl TensorParallelRowLinear {
             #[cfg(feature = "nccl")]
             all_reduce,
             bias,
+            dtype,
+        }
+    }
+
+    /// Create a row-linear without a communicator (for alloc-then-load workflow).
+    /// The all-reduce will be wired up during the data-loading pass.
+    #[allow(unused_variables)]
+    pub fn new_empty(linear: Linear, world_size: usize, dtype: DType) -> Self {
+        Self {
+            linear,
+            #[cfg(feature = "nccl")]
+            all_reduce: None,
+            bias: None,
             dtype,
         }
     }
@@ -1232,6 +1246,10 @@ impl TensorParallelRowLinear {
 }
 
 impl ReplicatedLinear {
+    pub fn weight(&self) -> &Tensor {
+        self.linear.weight()
+    }
+
     pub fn from(linear: Linear) -> Result<Self> {
         Ok(Self { linear })
     }
@@ -1281,6 +1299,49 @@ impl ReplicatedLinear {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.linear.forward(x)
+    }
+}
+
+/// Allocate a replicated linear, detecting FP8 scales in the TensorIndex.
+/// FP8 weights produce `LinearX::LnFp8`; others produce a standard `LinearX::Linear`.
+pub fn alloc_replicated_fp8_linear(
+    ti: &mut TensorIndex,
+    prefix: &str,
+    out_dim: usize,
+    in_dim: usize,
+    has_bias: bool,
+    block_size: &[usize],
+    device: &Device,
+) -> Result<ReplicatedLinear> {
+    let s_name = format!("{}.weight_scale_inv", prefix);
+    if !block_size.is_empty() && ti.tensors.contains_key(&s_name) {
+        // FP8: allocate weight + scale, wrap in LnFp8
+        let (weight, scale) = ti.alloc_weight_scale(
+            prefix, (out_dim, in_dim), block_size, Dist::Replicated, device,
+        )?;
+        let bias = if has_bias {
+            let b_name = format!("{}.bias", prefix);
+            if ti.tensors.contains_key(&b_name) {
+                let b = ti.alloc_zeros(&b_name, out_dim, device)?;
+                ti.register(&b_name, b.clone(), Dist::Replicated);
+                Some(b)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let ln = Linear::LnFp8(LnFp8::from_prealloc(
+            weight,
+            scale.expect("alloc_weight_scale returned Some(scale)"),
+            bias,
+            block_size.to_vec(),
+        ));
+        Ok(ReplicatedLinear::from(ln)?)
+    } else {
+        // Standard: allocate weight (and bias), wrap in Linear
+        let (w, b) = ti.alloc_replicated_linear(prefix, out_dim, in_dim, has_bias, device)?;
+        ReplicatedLinear::from_weight_bias(w, b)
     }
 }
 
@@ -1428,6 +1489,10 @@ fn pad_vocab_size(vocab_size: usize, world_size: usize) -> usize {
 }
 
 impl VocabParallelLinear {
+    pub fn weight(&self) -> &Tensor {
+        self.linear.weight()
+    }
+
     #[allow(unused_variables)]
     pub fn load_no_bias(
         in_dim: usize,
@@ -1469,6 +1534,30 @@ impl VocabParallelLinear {
             #[cfg(feature = "nccl")]
             all_gather,
             org_vocab_size: out_dim,
+            dtype,
+        })
+    }
+
+    /// Allocate a vocab-parallel linear from pre-computed local weight.
+    #[allow(unused_variables)]
+    pub fn new_alloc(
+        weight: Tensor,
+        comm: Rc<Comm>,
+        org_vocab_size: usize,
+        dtype: DType,
+    ) -> Result<Self> {
+        let linear = Linear::new(weight, None, &None)?;
+        #[cfg(feature = "nccl")]
+        let all_gather = if comm.world_size() > 1 {
+            Some(AllGather::new(comm))
+        } else {
+            None
+        };
+        Ok(Self {
+            linear,
+            #[cfg(feature = "nccl")]
+            all_gather,
+            org_vocab_size,
             dtype,
         })
     }

@@ -14,6 +14,7 @@ use xinfer::models::layers::VarBuilderX;
 use xinfer::runner::{receive_local, send_local, MessageType};
 use xinfer::transfer::PdRole;
 use xinfer::transfer::Transfer;
+use xinfer::utils::config::ModelType;
 use xinfer::utils::gguf_helper::load_gguf_info_from_files;
 use xinfer::utils::guidance::build_llg_factory;
 use xinfer::utils::heartbeat::heartbeat_worker;
@@ -24,7 +25,7 @@ pub fn run_runner() -> anyhow::Result<()> {
     xinfer::log_info!("runner started");
 
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let args: Vec<String> = if let Ok(encoded) = std::env::var("XINFER_RUNNER_ARGS") {
         encoded.split('\x1f').map(String::from).collect()
@@ -182,15 +183,19 @@ pub fn run_runner() -> anyhow::Result<()> {
             #[allow(unused_mut)]
             let mut runner = {
                 let _guard = candle_core::InferenceMode::enter();
-                let vb = VarBuilderX::new(
-                    &init_req.model_pathes,
-                    init_req.is_gguf,
-                    init_req.dtype.into(),
-                    &device,
-                )?;
+                let vb = if matches!(init_req.model_type, ModelType::GLM5) {
+                    None
+                } else {
+                    Some(VarBuilderX::new(
+                        &init_req.model_pathes,
+                        init_req.is_gguf,
+                        init_req.dtype.into(),
+                        &device,
+                    )?)
+                };
                 let runner = ModelRunner::new(
                     init_req.model_type,
-                    &vb,
+                    vb.as_ref(),
                     comm,
                     &mut econfig,
                     &init_req.config,

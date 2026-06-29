@@ -536,6 +536,19 @@ pub enum LinearX {
     LnNvfp4(LnNvfp4),
 }
 
+impl LinearX {
+    /// Returns the primary weight tensor for this linear layer.
+    pub fn weight(&self) -> &Tensor {
+        match self {
+            Self::Linear(ln) => ln.weight(),
+            Self::LnFp8(ln) => &ln.weight,
+            Self::LnMxfp4(ln) => &ln.blocks,
+            Self::LnNvfp4(ln) => &ln.blocks,
+            Self::QLinear(_) => panic!("QLinear::weight not supported"),
+        }
+    }
+}
+
 impl Module for LinearX {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
@@ -1066,6 +1079,23 @@ impl LnFp8 {
             weight_block_size: block_size,
             sm_version,
         })
+    }
+    /// Construct from pre-allocated weight and scale tensors (alloc path).
+    /// Assumes `weight_scale_cutlass` is None (SM < 90) and `sm_version` is 0.
+    pub fn from_prealloc(
+        weight: Tensor,
+        weight_scale: Tensor,
+        bias: Option<Tensor>,
+        weight_block_size: Vec<usize>,
+    ) -> Self {
+        Self {
+            weight,
+            weight_scale,
+            weight_scale_cutlass: None,
+            bias,
+            weight_block_size,
+            sm_version: 0,
+        }
     }
 }
 

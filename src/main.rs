@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let mut args = Args::parse();
     args.normalize_model_args()?;

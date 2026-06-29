@@ -1,9 +1,10 @@
-use crate::models::layers::distributed::ReplicatedLinear;
-use crate::models::layers::others::{layer_norm, NormX};
+use crate::models::layers::distributed::{ReplicatedLinear, alloc_replicated_fp8_linear};
+use crate::models::layers::others::{layer_norm, layer_norm_alloc, NormX};
 use crate::models::layers::rotary_emb::ApplyRotaryEmbedding;
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
-use candle_core::{DType, Result, Tensor, D};
+use crate::utils::tensor_index::TensorIndex;
+use candle_core::{DType, Device, Result, Tensor, D};
 use std::sync::Arc;
 
 pub struct IndexerConfig {
@@ -78,6 +79,44 @@ impl DsaIndexer {
             cfg,
             score_scale,
         })
+    }
+
+    /// Allocate indexer weights as empty GPU buffers (no data).
+    pub fn new_alloc(
+        ti: &mut TensorIndex,
+        cfg: IndexerConfig,
+        prefix: &str,  // e.g. "model.layers.0.self_attn.indexer"
+        block_size: &[usize],
+        device: &Device,
+    ) -> Result<Self> {
+        let wq_b = alloc_replicated_fp8_linear(
+            ti, &format!("{}.wq_b", prefix),
+            cfg.index_n_heads * cfg.index_head_dim,
+            cfg.q_lora_rank,
+            false, block_size, device,
+        )?;
+
+        let wk = alloc_replicated_fp8_linear(
+            ti, &format!("{}.wk", prefix),
+            cfg.index_head_dim,
+            cfg.hidden_size,
+            false, block_size, device,
+        )?;
+
+        let k_norm = layer_norm_alloc(cfg.index_head_dim, 1e-6, ti, &format!("{}.k_norm", prefix), DType::BF16, device)?;
+
+        let weights_proj = alloc_replicated_fp8_linear(
+            ti, &format!("{}.weights_proj", prefix),
+            cfg.index_n_heads,
+            cfg.hidden_size,
+            false, block_size, device,
+        )?;
+
+        let softmax_scale = 1.0 / (cfg.index_head_dim as f32).sqrt();
+        let head_scale = (cfg.index_n_heads as f32).powf(-0.5);
+        let score_scale = softmax_scale * head_scale;
+
+        Ok(Self { wq_b, wk, k_norm, weights_proj, cfg, score_scale })
     }
 
     pub fn index_topk(&self) -> usize {

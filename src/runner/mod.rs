@@ -493,7 +493,7 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
 
     crate::log_info!("runner started");
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let sock = args
@@ -646,15 +646,19 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
             #[allow(unused_mut)]
             let mut runner = {
                 let _guard = candle_core::InferenceMode::enter();
-                let vb = VarBuilderX::new(
-                    &init_req.model_pathes,
-                    init_req.is_gguf,
-                    init_req.dtype.into(),
-                    &device,
-                )?;
+                let vb = if matches!(init_req.model_type, ModelType::GLM5) {
+                    None
+                } else {
+                    Some(VarBuilderX::new(
+                        &init_req.model_pathes,
+                        init_req.is_gguf,
+                        init_req.dtype.into(),
+                        &device,
+                    )?)
+                };
                 let runner = ModelRunner::new(
                     init_req.model_type,
-                    &vb,
+                    vb.as_ref(),
                     comm,
                     &mut econfig,
                     &init_req.config,
